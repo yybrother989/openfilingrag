@@ -32,6 +32,7 @@ dependencies = [
     "tenacity>=9.0.0",
     "docling>=2.0",
     "docling-core>=2.0",
+    "sentence-transformers>=3.0",
     "python-dotenv>=1.0.0",
     "structlog>=24.1.0",
     "rapidfuzz>=3.9.0",

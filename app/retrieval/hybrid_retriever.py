@@ -44,6 +44,7 @@ from .metadata_filter import (
 )
 from .pg_fts_retriever import PGFTSRetriever
 from .pg_vector_store import build_pg_vector
+from .reranker import FilingsReranker
 
 if TYPE_CHECKING:
     from langchain_postgres import PGVector
@@ -74,11 +75,13 @@ class HybridRetriever:
         vector_store: "PGVector | None" = None,
         fts_retriever: PGFTSRetriever | None = None,
         weights: HybridWeights | None = None,
+        reranker: FilingsReranker | None = None,
     ) -> None:
         self.embedding_service = embedding_service
         self._vector_store = vector_store
         self._fts_retriever = fts_retriever
         self.w = weights or HybridWeights()
+        self.reranker = reranker or FilingsReranker()
 
     # -- lazy backends ---------------------------------------------------
     @property
@@ -143,7 +146,14 @@ class HybridRetriever:
             )
             kw_docs = self._build_fts(k=top_k * 4, filt=relaxed).invoke(query.query)
 
-        return self._fuse(vec_docs, kw_docs, plan, top_k)
+        # When the reranker is enabled we surface a larger pool from
+        # fusion so the cross-encoder has more candidates to reorder.
+        # With reranker disabled this collapses to the previous flow.
+        pool_size = max(top_k, self.reranker.pool_k) if self.reranker.enabled else top_k
+        fused = self._fuse(vec_docs, kw_docs, plan, pool_size)
+        if not self.reranker.enabled:
+            return fused[:top_k]
+        return self.reranker.rerank(query.query, fused, top_n=top_k)
 
     # -- fusion ----------------------------------------------------------
     def _fuse(
