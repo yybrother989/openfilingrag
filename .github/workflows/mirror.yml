@@ -24,6 +24,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Don't bake GITHUB_TOKEN into git config as an extraheader.
+          # Otherwise it overrides the PAT we embed in the push URL and
+          # the push goes as github-actions[bot] (which has no access to
+          # TryChorusAI/openfilingrag) → 403.
+          persist-credentials: false
 
       - name: Push branches and tags to TryChorusAI/openfilingrag
         env:
