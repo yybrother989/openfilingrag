@@ -25,16 +25,35 @@ half of ``app/db/migrations/002_langchain_pgvector.sql``.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from typing import Any
 
 import sqlalchemy as sa
 from langchain_core.documents import Document as LCDocument
-from pgvector.sqlalchemy import Vector  # registers the vector type
 
 from app.core.config import settings
 from app.retrieval.pg_vector_store import build_pg_vector
 from app.services.embedding_service import EmbeddingService
+
+
+def _parse_embedding(raw: Any) -> list[float] | None:
+    """pgvector columns come back as the literal text ``"[0.1, -0.2, ...]"``
+    when read via raw SQL (the vector type adapter only kicks in on ORM
+    columns). Parse to a list of floats so PGVector can write it back."""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [float(x) for x in raw]
+    if isinstance(raw, str):
+        try:
+            return [float(x) for x in json.loads(raw)]
+        except (ValueError, json.JSONDecodeError):
+            return None
+    try:
+        return [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
 
 
 SELECT_BATCH = sa.text(
@@ -77,7 +96,7 @@ def _row_to_lcdoc(row: Any) -> tuple[LCDocument, list[float] | None, str]:
         "metric_tags": list(row.metric_tags or []),
         "risk_tags": list(row.risk_tags or []),
     }
-    embedding = list(row.embedding) if row.embedding is not None else None
+    embedding = _parse_embedding(row.embedding)
     return (
         LCDocument(page_content=row.chunk_text or "", metadata=metadata),
         embedding,

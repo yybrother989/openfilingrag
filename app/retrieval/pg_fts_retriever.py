@@ -146,6 +146,8 @@ def _field_clause(field: str, value: Any, params: dict[str, Any]) -> str:
 def _eq_clause(field: str, value: Any, params: dict[str, Any]) -> str:
     name = f"f_{len(params)}"
     # cmetadata @> '{"field": value}'::jsonb matches both
-    # {field: value} and {field: [..., value, ...]}.
+    # {field: value} and {field: [..., value, ...]}. Use CAST(...) instead
+    # of the ``::jsonb`` shorthand so SQLAlchemy text param parsing does
+    # not collide with the Postgres double-colon cast operator.
     params[name] = json.dumps({field: value})
-    return f"cmetadata @> :{name}::jsonb"
+    return f"cmetadata @> CAST(:{name} AS jsonb)"
