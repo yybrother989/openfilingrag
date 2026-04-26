@@ -1,0 +1,39 @@
+name: Mirror to TryChorusAI
+
+# Source of truth lives here (yybrother989/openfilingrag). This workflow
+# pushes all branches + tags to TryChorusAI/openfilingrag so the org
+# profile stays in sync with future commits. Issues / PRs / Discussions
+# stay in this repo only — Issues are disabled on the mirror.
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  delete:
+  workflow_dispatch:
+  # Daily safety net in case a push event was missed.
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Skip noise on the mirror's own forks if any.
+    if: github.repository == 'yybrother989/openfilingrag'
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push branches and tags to TryChorusAI/openfilingrag
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "::error::MIRROR_TOKEN secret is not set. See repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          git push --force \
+            "https://x-access-token:${MIRROR_TOKEN}@github.com/TryChorusAI/openfilingrag.git" \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
