@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "research": "app.graph.workflow:build_langgraph"
+  },
+  "env": ".env"
+}

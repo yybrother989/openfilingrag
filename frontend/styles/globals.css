@@ -1,0 +1,185 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: 35 24% 97%;
+  --foreground: 210 22% 16%;
+  --card: 0 0% 100%;
+  --card-foreground: 210 22% 16%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 210 22% 16%;
+  --primary: 211 65% 52%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 20% 95%;
+  --secondary-foreground: 210 22% 16%;
+  --muted: 210 20% 95%;
+  --muted-foreground: 215 14% 42%;
+  --accent: 39 52% 93%;
+  --accent-foreground: 210 22% 16%;
+  --destructive: 2 74% 58%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 18% 84%;
+  --input: 214 18% 84%;
+  --ring: 211 65% 52%;
+  --success: 145 61% 36%;
+  --warning: 36 84% 44%;
+  --surface-input: 0 0% 100%;
+  --scrollbar-thumb: 214 12% 78%;
+  --scrollbar-thumb-hover: 214 12% 68%;
+  --gradient-end: 40 18% 96%;
+  --composer-bg: 0 0% 100% / 0.96;
+  --composer-shadow: 215 30% 20% / 0.06;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 220 14% 10%;
+  --foreground: 210 18% 92%;
+  --card: 220 14% 14%;
+  --card-foreground: 210 18% 92%;
+  --popover: 220 14% 14%;
+  --popover-foreground: 210 18% 92%;
+  --primary: 211 70% 60%;
+  --primary-foreground: 220 14% 10%;
+  --secondary: 220 12% 18%;
+  --secondary-foreground: 210 18% 92%;
+  --muted: 220 12% 18%;
+  --muted-foreground: 215 12% 64%;
+  --accent: 220 12% 22%;
+  --accent-foreground: 210 18% 92%;
+  --destructive: 2 70% 60%;
+  --destructive-foreground: 220 14% 10%;
+  --border: 220 12% 22%;
+  --input: 220 12% 22%;
+  --ring: 211 70% 60%;
+  --success: 145 50% 50%;
+  --warning: 36 84% 56%;
+  --surface-input: 220 14% 14%;
+  --scrollbar-thumb: 220 10% 30%;
+  --scrollbar-thumb-hover: 220 10% 40%;
+  --gradient-end: 220 14% 12%;
+  --composer-bg: 220 14% 14% / 0.96;
+  --composer-shadow: 0 0% 0% / 0.4;
+}
+
+html,
+body {
+  height: 100%;
+  background: hsl(var(--background));
+}
+
+body {
+  margin: 0;
+  font-family:
+    "SF Pro Text",
+    "Segoe UI",
+    ui-sans-serif,
+    system-ui,
+    sans-serif;
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--scrollbar-thumb));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--scrollbar-thumb-hover));
+}
+
+.workbench-input {
+  width: 100%;
+  min-height: 2.5rem;
+  border-radius: 0.55rem;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--surface-input));
+  padding: 0.55rem 0.7rem;
+  color: hsl(var(--foreground));
+  outline: none;
+}
+
+.workbench-input:focus {
+  border-color: hsl(var(--ring));
+  box-shadow: 0 0 0 3px hsl(var(--ring) / 0.12);
+}
+
+.assistant-shell {
+  --aui-background: var(--background);
+  --aui-foreground: var(--foreground);
+  --aui-card: var(--card);
+  --aui-card-foreground: var(--card-foreground);
+  --aui-popover: var(--popover);
+  --aui-popover-foreground: var(--popover-foreground);
+  --aui-primary: var(--primary);
+  --aui-primary-foreground: var(--primary-foreground);
+  --aui-secondary: var(--secondary);
+  --aui-secondary-foreground: var(--secondary-foreground);
+  --aui-muted: var(--muted);
+  --aui-muted-foreground: var(--muted-foreground);
+  --aui-accent: var(--accent);
+  --aui-accent-foreground: var(--accent-foreground);
+  --aui-destructive: var(--destructive);
+  --aui-destructive-foreground: var(--destructive-foreground);
+  --aui-border: var(--border);
+  --aui-input: var(--input);
+  --aui-ring: var(--ring);
+  --aui-radius: 0.75rem;
+  --aui-thread-max-width: 46rem;
+}
+
+.assistant-shell .aui-thread-root {
+  background:
+    linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--gradient-end)) 100%);
+}
+
+.assistant-shell .aui-thread-viewport {
+  padding-top: 1.25rem;
+}
+
+.assistant-shell .aui-thread-viewport-footer {
+  padding-bottom: 1rem;
+  background:
+    linear-gradient(180deg, hsl(var(--background) / 0) 0%, hsl(var(--background)) 38%);
+}
+
+.assistant-shell .aui-composer-root {
+  border-radius: 0.9rem;
+  background: hsl(var(--composer-bg));
+  border-color: hsl(var(--border));
+  box-shadow: 0 18px 40px hsl(var(--composer-shadow));
+}
+
+.assistant-shell .aui-thread-welcome-suggestions,
+.assistant-shell .aui-thread-followup-suggestions {
+  flex-wrap: wrap;
+}
+
+.assistant-shell .aui-user-message-content {
+  border-radius: 1.15rem;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+}
+
+.assistant-shell .aui-assistant-message-content {
+  max-width: 100%;
+}
+
+@media (max-width: 1024px) {
+  .assistant-shell .aui-thread-max-width {
+    width: 100%;
+  }
+}
