@@ -1,28 +1,26 @@
-"""Document ingestion: parse → split → chunk → enrich → embed → persist."""
+"""Document ingestion: parse → split → chunk → enrich → embed → persist.
 
-from .chunker import Chunk, Chunker
-from .html_parser import HTMLParser, TextParser
-from .metadata_enricher import MetadataEnricher
-from .pdf_parser import PDFParser
+Parsing/sectioning/chunking/table extraction is delegated to Docling
+(see :mod:`.docling_adapter`). This module only re-exports the types
+and the orchestration entry point.
+"""
+
+from .docling_adapter import DoclingIngestor, IngestionArtifacts
+from .metadata_enricher import EnrichedChunk, MetadataEnricher
 from .pipeline import IngestionPipeline
-from .section_splitter import (
-    SECTION_PATTERNS,
-    DetectedSection,
-    SectionSplitter,
-)
-from .table_extractor import ExtractedTable, TableExtractor
+from .sec_sections import SECTION_PATTERNS, find_section_breaks, match_canonical_section
+from .types import Chunk, DetectedSection, ExtractedTable
 
 __all__ = [
     "SECTION_PATTERNS",
     "Chunk",
-    "Chunker",
     "DetectedSection",
+    "DoclingIngestor",
+    "EnrichedChunk",
     "ExtractedTable",
-    "HTMLParser",
+    "IngestionArtifacts",
     "IngestionPipeline",
     "MetadataEnricher",
-    "PDFParser",
-    "SectionSplitter",
-    "TableExtractor",
-    "TextParser",
+    "find_section_breaks",
+    "match_canonical_section",
 ]

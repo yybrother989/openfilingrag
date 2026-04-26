@@ -1,13 +1,11 @@
 """End-to-end ingestion pipeline.
 
 Flow:
-  1. Parse the file (PDF/HTML/text → ParsedDocument)
-  2. Detect canonical sections
-  3. Optionally extract financial tables (PDF only)
-  4. Chunk each section
-  5. Enrich chunks with content_type + metric/risk tags
-  6. Embed chunks
-  7. Upsert Company → Document → Sections → Tables → Chunks
+  1. Parse + chunk + extract tables in one Docling pass (or plain-text
+     fallback for .txt). See :mod:`.docling_adapter`.
+  2. Enrich chunks with content_type + metric/risk tags.
+  3. Embed chunks.
+  4. Upsert Company → Document → Sections → Tables → Chunks.
 
 Designed to be transactional: a single SQLAlchemy session does all writes
 and commits at the end. On failure, nothing is partially persisted.
@@ -20,7 +18,6 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from app.core.errors import UnsupportedFormatError
 from app.core.logging import get_logger
 from app.db.models import (
     Company,
@@ -31,13 +28,9 @@ from app.db.models import (
 )
 from app.schemas.document import DocumentMetadata, IngestionResult
 
-from .chunker import Chunker
-from .html_parser import HTMLParser, TextParser
+from .docling_adapter import DoclingIngestor
 from .metadata_enricher import MetadataEnricher
-from .pdf_parser import PDFParser
-from .section_splitter import SectionSplitter
 from .source_id import chunk_source_id
-from .table_extractor import TableExtractor
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -48,27 +41,18 @@ log = get_logger(__name__)
 
 
 class IngestionPipeline:
-    """Orchestrates parsing → splitting → chunking → enrichment → embedding → DB write."""
+    """Orchestrates Docling parsing/chunking → enrichment → embedding → DB write."""
 
     def __init__(
         self,
         embedding_service: "EmbeddingService",
-        chunker: Chunker | None = None,
-        splitter: SectionSplitter | None = None,
+        ingestor: DoclingIngestor | None = None,
         enricher: MetadataEnricher | None = None,
     ) -> None:
         self.embedding_service = embedding_service
-        self.chunker = chunker or Chunker()
-        self.splitter = splitter or SectionSplitter()
+        self.ingestor = ingestor or DoclingIngestor()
         self.enricher = enricher or MetadataEnricher()
-        self.pdf_parser = PDFParser()
-        self.html_parser = HTMLParser()
-        self.text_parser = TextParser()
-        self.table_extractor = TableExtractor()
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
     def ingest(
         self,
         file_path: str | Path,
@@ -84,17 +68,16 @@ class IngestionPipeline:
         )
         warnings: list[str] = []
 
-        parsed = self._parse(path)
-        sections = self.splitter.split(parsed.full_text, parsed.char_to_page)
-        log.info("sections detected", count=len(sections))
-
-        tables = []
-        if path.suffix.lower() == ".pdf":
-            tables = self.table_extractor.extract(path)
-            log.info("tables detected", count=len(tables))
-
-        chunks = self.chunker.chunk_sections(sections, parsed.char_to_page)
-        log.info("chunks created", count=len(chunks))
+        artifacts = self.ingestor.ingest_file(path)
+        sections = artifacts.sections
+        chunks = artifacts.chunks
+        tables = artifacts.tables
+        log.info(
+            "ingest parsed",
+            sections=len(sections),
+            chunks=len(chunks),
+            tables=len(tables),
+        )
         if not chunks:
             warnings.append("no chunks produced — document may be empty or unreadable")
 
@@ -113,7 +96,7 @@ class IngestionPipeline:
             filing_date=meta.filing_date,
             source_url=meta.source_url,
             source_priority=meta.source_priority.value,
-            page_count=parsed.page_count,
+            page_count=artifacts.page_count or None,
             raw_path=str(path),
         )
         session.add(document)
@@ -213,19 +196,6 @@ class IngestionPipeline:
             warnings=warnings,
         )
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-    def _parse(self, path: Path):
-        ext = path.suffix.lower()
-        if ext == ".pdf":
-            return self.pdf_parser.parse(path)
-        if ext in {".html", ".htm"}:
-            return self.html_parser.parse(path)
-        if ext in {".txt", ".md"}:
-            return self.text_parser.parse(path)
-        raise UnsupportedFormatError(f"unsupported file type: {ext or '<none>'}")
-
     @staticmethod
     def _get_or_create_company(session: "Session", meta: DocumentMetadata) -> Company:
         company = session.scalar(select(Company).where(Company.ticker == meta.ticker))
@@ -240,13 +210,6 @@ class IngestionPipeline:
 
     @staticmethod
     def _build_section_ordinal_lookup(sections) -> dict[str, int]:
-        """Map canonical_name → first ordinal where it appears.
-
-        Used to attach chunks to their parent section row. If the same
-        canonical section appears twice (rare but possible — e.g. an
-        amended filing with two MD&A blocks) the chunks all link to the
-        first occurrence; this is a known limitation.
-        """
         out: dict[str, int] = {}
         for s in sections:
             out.setdefault(s.canonical_name, s.ordinal)
