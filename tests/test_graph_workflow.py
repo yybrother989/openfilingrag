@@ -29,7 +29,7 @@ from app.schemas.query import ResearchIntent, ResearchQuery
 class _StubRetriever:
     items: list[EvidenceItem]
 
-    def retrieve(self, session, query, plan, k=None):  # noqa: D401, ARG002
+    def retrieve(self, query, plan=None, k=None):  # noqa: D401, ARG002
         return list(self.items)
 
 

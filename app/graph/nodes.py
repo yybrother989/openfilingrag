@@ -256,7 +256,7 @@ def retrieve_evidence(state: GraphState, ctx: NodeContext) -> GraphState:
     if state.refused:
         return state
     plan = state.retrieval_plan
-    items = ctx.retriever.retrieve(ctx.session, state.user_query, plan)
+    items = ctx.retriever.retrieve(state.user_query, plan)
     state.evidence_items = items
 
     for item in items:

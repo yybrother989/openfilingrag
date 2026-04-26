@@ -1,4 +1,9 @@
-"""Hybrid retriever fusion logic, exercised against in-memory stub stores."""
+"""Hybrid retriever fusion logic, exercised against in-memory stubs.
+
+The retriever now talks to LangChain ``Document`` lists (PGVector +
+PGFTSRetriever output shape). We bypass the real Postgres backends with
+``vector_store=`` and ``fts_retriever=`` injection.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 
 import pytest
+from langchain_core.documents import Document
 
 from app.retrieval.hybrid_retriever import HybridRetriever
 from app.schemas.document import (
@@ -19,81 +25,58 @@ from app.schemas.graph_state import RetrievalPlan
 from app.schemas.query import ResearchIntent, ResearchQuery
 
 
-@dataclass
-class FakeChunk:
-    """Quacks like ``app.db.models.DocumentChunk`` for the retriever's purposes."""
-
-    id: int
-    source_id: uuid.UUID
-    document_id: int
-    chunk_index: int
-    ticker: str
-    company_name: str
-    document_type: str
-    fiscal_year: int | None
-    filing_date: None
-    source_priority: str
-    section: str
-    subsection: str | None
-    content_type: str
-    page_start: int | None
-    page_end: int | None
-    chunk_text: str
-    metric_tags: list[str]
-    risk_tags: list[str]
-
-
-def _chunk(
-    cid: int, section: str, text: str, score: float = 0.7
-) -> tuple[FakeChunk, float]:
-    chunk = FakeChunk(
-        id=cid,
-        source_id=uuid.uuid4(),
-        document_id=1,
-        chunk_index=cid,
-        ticker="ACME",
-        company_name="Acme Corp",
-        document_type=DocumentType.TEN_K.value,
-        fiscal_year=2025,
-        filing_date=None,
-        source_priority=SourcePriority.PRIMARY_FILING.value,
-        section=section,
-        subsection=None,
-        content_type=ContentType.RISK_FACTOR.value
-        if section == CanonicalSection.RISK_FACTORS.value
-        else ContentType.PARAGRAPH.value,
-        page_start=10,
-        page_end=11,
-        chunk_text=text,
-        metric_tags=[],
-        risk_tags=["macroeconomic"] if "macroeconomic" in text else [],
+def _doc(section: str, text: str) -> Document:
+    return Document(
+        page_content=text,
+        metadata={
+            "source_id": str(uuid.uuid4()),
+            "document_id": 1,
+            "chunk_index": 0,
+            "ticker": "ACME",
+            "company_name": "Acme Corp",
+            "document_type": DocumentType.TEN_K.value,
+            "fiscal_year": 2025,
+            "filing_date": None,
+            "source_priority": SourcePriority.PRIMARY_FILING.value,
+            "section": section,
+            "content_type": (
+                ContentType.RISK_FACTOR.value
+                if section == CanonicalSection.RISK_FACTORS.value
+                else ContentType.PARAGRAPH.value
+            ),
+            "page_start": 10,
+            "page_end": 11,
+            "metric_tags": [],
+            "risk_tags": ["macroeconomic"] if "macroeconomic" in text else [],
+        },
     )
-    return chunk, score
 
 
-class _StubVector:
-    def __init__(self, hits: list[tuple[FakeChunk, float]]):
-        self._hits = hits
+@dataclass
+class _StubVectorStore:
+    """Quacks like ``langchain_postgres.PGVector`` for the retriever's call site."""
 
-    def search(self, session, embedding, where=None, k=50):  # noqa: D401, ARG002
-        return self._hits
+    docs: list[Document]
+
+    def similarity_search(self, query, k=4, filter=None):  # noqa: ARG002
+        return list(self.docs)
 
 
-class _StubKeyword:
-    def __init__(self, hits: list[tuple[FakeChunk, float]]):
-        self._hits = hits
+@dataclass
+class _StubFTSRetriever:
+    docs: list[Document]
 
-    def search(self, session, query, where=None, k=50):  # noqa: D401, ARG002
-        return self._hits
+    def invoke(self, query):  # noqa: ARG002
+        return list(self.docs)
 
 
 def test_returns_evidence_items_with_scores(mock_embedding) -> None:
-    risk = _chunk(1, CanonicalSection.RISK_FACTORS.value, "macroeconomic risk discussion", 0.9)
-    business = _chunk(2, CanonicalSection.BUSINESS.value, "company makes widgets", 0.4)
+    risk = _doc(CanonicalSection.RISK_FACTORS.value, "macroeconomic risk discussion")
+    business = _doc(CanonicalSection.BUSINESS.value, "company makes widgets")
     retriever = HybridRetriever(
         embedding_service=mock_embedding,
-        vector_store=_StubVector([risk, business]),
-        keyword_search=_StubKeyword([risk]),
+        vector_store=_StubVectorStore([risk, business]),
+        fts_retriever=_StubFTSRetriever([risk]),
     )
     plan = RetrievalPlan(
         intent=ResearchIntent.RISK_ANALYSIS,
@@ -101,7 +84,6 @@ def test_returns_evidence_items_with_scores(mock_embedding) -> None:
         top_k=5,
     )
     items = retriever.retrieve(
-        session=None,
         query=ResearchQuery(query="What risks?", ticker="ACME"),
         plan=plan,
     )
@@ -112,19 +94,20 @@ def test_returns_evidence_items_with_scores(mock_embedding) -> None:
     assert items[0].relevance_score > items[-1].relevance_score
 
 
-def test_fallback_to_relaxed_filter(mock_embedding) -> None:
-    """When strict filter returns nothing, retriever should still degrade."""
+def test_fallback_returns_empty_when_no_data(mock_embedding) -> None:
+    """When neither leg returns hits and the relaxed retry also returns
+    empty, the retriever degrades to an empty list rather than raising.
+    """
     retriever = HybridRetriever(
         embedding_service=mock_embedding,
-        vector_store=_StubVector([]),
-        keyword_search=_StubKeyword([]),
+        vector_store=_StubVectorStore([]),
+        fts_retriever=_StubFTSRetriever([]),
     )
     items = retriever.retrieve(
-        session=None,
         query=ResearchQuery(query="risks", ticker="ACME"),
         plan=RetrievalPlan(intent=ResearchIntent.RISK_ANALYSIS, top_k=5),
     )
-    assert items == []  # no data at all → empty, not exception
+    assert items == []
 
 
 @pytest.mark.parametrize("section", [
@@ -132,14 +115,13 @@ def test_fallback_to_relaxed_filter(mock_embedding) -> None:
     CanonicalSection.RISK_FACTORS.value,
 ])
 def test_score_breakdown_present(section, mock_embedding) -> None:
-    hit = _chunk(1, section, "some text", 0.5)
+    hit = _doc(section, "some text")
     retriever = HybridRetriever(
         embedding_service=mock_embedding,
-        vector_store=_StubVector([hit]),
-        keyword_search=_StubKeyword([]),
+        vector_store=_StubVectorStore([hit]),
+        fts_retriever=_StubFTSRetriever([]),
     )
     items = retriever.retrieve(
-        session=None,
         query=ResearchQuery(query="anything", ticker="ACME"),
         plan=RetrievalPlan(intent=ResearchIntent.GENERIC_FILING_QA),
     )
