@@ -49,11 +49,11 @@ from .nodes import (
 )
 
 if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
     from sqlalchemy.orm import Session
 
     from app.retrieval.evidence_store import EvidenceStore
     from app.retrieval.hybrid_retriever import HybridRetriever
-    from app.services.llm_service import LLMService
 
 log = get_logger(__name__)
 
@@ -74,6 +74,11 @@ NODE_ORDER = [
 def build_langgraph():
     """Build & compile the StateGraph.
 
+    Topology is mostly linear, with a ``validate_report → generate_report``
+    self-correction loop. The conditional edge fires when the validate
+    node sets ``state.revision_required`` (e.g. a finding lacks citations
+    or cites an unknown source_id) and ``revision_count < MAX_REVISIONS``.
+
     Nodes are wrapped with :func:`make_langgraph_adapter` so the original
     ``(state, ctx)`` signature still works for unit tests, while the
     graph itself sees the LangGraph-native ``(state, config)`` shape.
@@ -84,10 +89,18 @@ def build_langgraph():
     for name, fn in NODE_ORDER:
         graph.add_node(name, make_langgraph_adapter(name, fn))
 
-    graph.add_edge(START, NODE_ORDER[0][0])
-    for i, (name, _) in enumerate(NODE_ORDER[:-1]):
-        graph.add_edge(name, NODE_ORDER[i + 1][0])
-    graph.add_edge(NODE_ORDER[-1][0], END)
+    graph.add_edge(START, "classify_query")
+    graph.add_edge("classify_query", "plan_retrieval")
+    graph.add_edge("plan_retrieval", "retrieve_evidence")
+    graph.add_edge("retrieve_evidence", "verify_evidence")
+    graph.add_edge("verify_evidence", "generate_report")
+    graph.add_edge("generate_report", "validate_report")
+    graph.add_conditional_edges(
+        "validate_report",
+        lambda s: "generate_report" if s.revision_required else "format_output",
+        {"generate_report": "generate_report", "format_output": "format_output"},
+    )
+    graph.add_edge("format_output", END)
 
     return graph.compile()
 
@@ -122,7 +135,7 @@ def run_workflow(
     query: ResearchQuery,
     *,
     session: "Session",
-    llm: "LLMService",
+    chat_model: "BaseChatModel",
     retriever: "HybridRetriever",
     evidence_store: "EvidenceStore | None" = None,
     emitter: EventEmitter | None = None,
@@ -141,7 +154,7 @@ def run_workflow(
     state = GraphState(user_query=query)
     ctx = NodeContext(
         session=session,
-        llm=llm,
+        chat_model=chat_model,
         retriever=retriever,
         evidence_store=evidence_store,
         cancel_event=cancel,
@@ -191,7 +204,7 @@ async def stream_workflow(
     query: ResearchQuery,
     *,
     session: "Session",
-    llm: "LLMService",
+    chat_model: "BaseChatModel",
     retriever: "HybridRetriever",
     evidence_store: "EvidenceStore | None" = None,
     thread_id: str | None = None,
@@ -216,7 +229,7 @@ async def stream_workflow(
             final_state = run_workflow(
                 query,
                 session=session,
-                llm=llm,
+                chat_model=chat_model,
                 retriever=retriever,
                 evidence_store=evidence_store,
                 emitter=emitter,

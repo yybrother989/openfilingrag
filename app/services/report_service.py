@@ -1,23 +1,27 @@
 """Builds the dependency bundle needed by the workflow.
 
 Centralizes constructor wiring so API routes don't have to know about
-``EmbeddingService``, ``LLMService``, ``HybridRetriever``, etc.
+chat models, embeddings, or retrievers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from app.retrieval.evidence_store import EvidenceStore
 from app.retrieval.hybrid_retriever import HybridRetriever
-from app.services.embedding_service import EmbeddingService
-from app.services.llm_service import LLMService
+from app.services.models import build_chat_model, build_embeddings
+
+if TYPE_CHECKING:
+    from langchain_core.embeddings import Embeddings
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 
 @dataclass
 class WorkflowDeps:
-    llm: LLMService
-    embedding: EmbeddingService
+    chat_model: "BaseChatModel"
+    embeddings: "Embeddings"
     retriever: HybridRetriever
     evidence_store: EvidenceStore
 
@@ -29,19 +33,18 @@ def get_workflow_deps() -> WorkflowDeps:
     """Lazy-build a process-wide singleton bundle.
 
     Cheap to construct in mock mode; in real mode this lazily initializes
-    the LLM and embedding clients on first use.
+    the chat-model and embedding clients on first use.
     """
     global _singleton
     if _singleton is None:
-        embedding = EmbeddingService()
-        llm = LLMService()
-        retriever = HybridRetriever(embedding_service=embedding)
-        evidence_store = EvidenceStore()
+        embeddings = build_embeddings()
+        chat_model = build_chat_model()
+        retriever = HybridRetriever(embeddings=embeddings)
         _singleton = WorkflowDeps(
-            llm=llm,
-            embedding=embedding,
+            chat_model=chat_model,
+            embeddings=embeddings,
             retriever=retriever,
-            evidence_store=evidence_store,
+            evidence_store=EvidenceStore(),
         )
     return _singleton
 

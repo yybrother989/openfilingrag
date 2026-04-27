@@ -47,9 +47,8 @@ from .pg_vector_store import build_pg_vector
 from .reranker import FilingsReranker
 
 if TYPE_CHECKING:
+    from langchain_core.embeddings import Embeddings
     from langchain_postgres import PGVector
-
-    from app.services.embedding_service import EmbeddingService
 
 log = get_logger(__name__)
 
@@ -71,13 +70,13 @@ class HybridRetriever:
 
     def __init__(
         self,
-        embedding_service: "EmbeddingService",
+        embeddings: "Embeddings",
         vector_store: "PGVector | None" = None,
         fts_retriever: PGFTSRetriever | None = None,
         weights: HybridWeights | None = None,
         reranker: FilingsReranker | None = None,
     ) -> None:
-        self.embedding_service = embedding_service
+        self.embeddings = embeddings
         self._vector_store = vector_store
         self._fts_retriever = fts_retriever
         self.w = weights or HybridWeights()
@@ -87,7 +86,7 @@ class HybridRetriever:
     @property
     def vector_store(self) -> "PGVector":
         if self._vector_store is None:
-            self._vector_store = build_pg_vector(self.embedding_service)
+            self._vector_store = build_pg_vector(self.embeddings)
         return self._vector_store
 
     def _build_fts(self, *, k: int, filt: dict[str, Any] | None) -> PGFTSRetriever:

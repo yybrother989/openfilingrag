@@ -41,7 +41,7 @@ def main() -> None:
     since = date.fromisoformat(args.since) if args.since else None
 
     deps = get_workflow_deps()
-    service = EdgarIngestService(embedding_service=deps.embedding)
+    service = EdgarIngestService(embeddings=deps.embeddings)
 
     with session_scope() as session:
         summary = service.pull_and_ingest(

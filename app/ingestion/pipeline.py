@@ -33,10 +33,9 @@ from .metadata_enricher import MetadataEnricher
 from .source_id import chunk_source_id
 
 if TYPE_CHECKING:
+    from langchain_core.embeddings import Embeddings
     from langchain_postgres import PGVector
     from sqlalchemy.orm import Session
-
-    from app.services.embedding_service import EmbeddingService
 
 log = get_logger(__name__)
 
@@ -46,12 +45,12 @@ class IngestionPipeline:
 
     def __init__(
         self,
-        embedding_service: "EmbeddingService",
+        embeddings: "Embeddings",
         ingestor: DoclingIngestor | None = None,
         enricher: MetadataEnricher | None = None,
         vector_store: "PGVector | None" = None,
     ) -> None:
-        self.embedding_service = embedding_service
+        self.embeddings = embeddings
         self.ingestor = ingestor or DoclingIngestor()
         self.enricher = enricher or MetadataEnricher()
         self._vector_store = vector_store
@@ -59,7 +58,7 @@ class IngestionPipeline:
     @property
     def vector_store(self) -> "PGVector":
         if self._vector_store is None:
-            self._vector_store = build_pg_vector(self.embedding_service)
+            self._vector_store = build_pg_vector(self.embeddings)
         return self._vector_store
 
     def ingest(

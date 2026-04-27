@@ -41,7 +41,7 @@ def research_query(
     state = run_workflow(
         body,
         session=session,
-        llm=deps.llm,
+        chat_model=deps.chat_model,
         retriever=deps.retriever,
         evidence_store=deps.evidence_store,
     )
@@ -125,7 +125,7 @@ async def research_stream(body: ResearchQuery, request: Request) -> StreamingRes
                 async for event in stream_workflow(
                     body,
                     session=session,
-                    llm=deps.llm,
+                    chat_model=deps.chat_model,
                     retriever=deps.retriever,
                     evidence_store=deps.evidence_store,
                     cancel_event=cancel_event,

@@ -35,7 +35,12 @@ from app.schemas.report import (
     RiskFactor,
 )
 
+from .citations import build_citation_corpus, numbers_to_source_ids
 from .event_emitter import emit
+from .llm_schemas import (
+    LLMClassifyOutput,
+    LLMReportDraft,
+)
 from .policies import (
     REFUSAL_MESSAGE,
     find_restricted_phrases,
@@ -47,16 +52,21 @@ from .prompts import (
     CLASSIFY_USER_TEMPLATE,
     GENERATE_SYSTEM,
     GENERATE_USER_TEMPLATE,
-    VALIDATE_SYSTEM,
-    VALIDATE_USER_TEMPLATE,
+    REVISION_FEEDBACK_TEMPLATE,
 )
 
 if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
+
     from app.retrieval.evidence_store import EvidenceStore
     from app.retrieval.hybrid_retriever import HybridRetriever
-    from app.services.llm_service import LLMService
 
 log = get_logger(__name__)
+
+
+# Hard upper bound on validate → generate retries. LangGraph default
+# recursion_limit is 25, which is far above this.
+MAX_REVISIONS = 2
 
 
 # ---------------------------------------------------------------------
@@ -65,7 +75,7 @@ log = get_logger(__name__)
 @dataclass
 class NodeContext:
     session: Session
-    llm: "LLMService"
+    chat_model: "BaseChatModel"
     retriever: "HybridRetriever"
     evidence_store: "EvidenceStore | None" = None
     # Cooperative cancellation: workflow loop checks this between nodes;
@@ -75,13 +85,7 @@ class NodeContext:
 
 
 def make_langgraph_adapter(node_name: str, fn):
-    """Wrap a ``(state, ctx)`` node for LangGraph's ``(state, config)`` ABI.
-
-    LangGraph injects a ``RunnableConfig``; we pull the per-run
-    :class:`NodeContext` out of ``config["configurable"]["node_context"]``
-    so the same node functions are usable both directly (tests) and
-    through ``graph.invoke``/``graph.astream``.
-    """
+    """Wrap a ``(state, ctx)`` node for LangGraph's ``(state, config)`` ABI."""
 
     def adapter(state: GraphState, config):
         ctx = config["configurable"]["node_context"]
@@ -130,8 +134,8 @@ def _wrap(node_name: str):
 def classify_query(state: GraphState, ctx: NodeContext) -> GraphState:
     user_query = state.user_query
 
-    # Pre-query compliance guard — refuse advice questions before we burn
-    # any tokens on classification or retrieval.
+    # Pre-query compliance guard — refuse advice questions before we
+    # burn any tokens on classification or retrieval.
     if is_advice_query(user_query.query):
         state.intent = ResearchIntent.REFUSED_ADVICE
         state.refused = True
@@ -148,36 +152,33 @@ def classify_query(state: GraphState, ctx: NodeContext) -> GraphState:
         )
         return state
 
-    payload = ctx.llm.chat_json(
-        system=CLASSIFY_SYSTEM,
-        user=CLASSIFY_USER_TEMPLATE.format(
-            query=user_query.query,
-            ticker=user_query.ticker or "null",
-            company_name=user_query.company_name or "null",
-            fiscal_year=user_query.fiscal_year or "null",
-        ),
+    structured = ctx.chat_model.with_structured_output(LLMClassifyOutput)
+    out: LLMClassifyOutput = structured.invoke(
+        [
+            {"role": "system", "content": CLASSIFY_SYSTEM},
+            {
+                "role": "user",
+                "content": CLASSIFY_USER_TEMPLATE.format(
+                    query=user_query.query,
+                    ticker=user_query.ticker or "null",
+                    company_name=user_query.company_name or "null",
+                    fiscal_year=user_query.fiscal_year or "null",
+                ),
+            },
+        ]
     )
 
-    try:
-        intent = ResearchIntent(payload.get("intent") or ResearchIntent.GENERIC_FILING_QA.value)
-    except ValueError:
-        intent = ResearchIntent.GENERIC_FILING_QA
-
-    state.intent = intent
-    state.ticker = (payload.get("ticker") or user_query.ticker or "").upper() or None
-    state.company_name = payload.get("company_name") or user_query.company_name
-    if user_query.fiscal_year:
-        fiscal_year = user_query.fiscal_year
-    else:
-        fy = payload.get("fiscal_year")
-        fiscal_year = int(fy) if isinstance(fy, (int, str)) and str(fy).isdigit() else None
+    state.intent = out.intent
+    state.ticker = (out.ticker or user_query.ticker or "").upper() or None
+    state.company_name = out.company_name or user_query.company_name
+    fiscal_year = user_query.fiscal_year or out.fiscal_year
     state.filters["fiscal_year"] = fiscal_year
-    state.filters["wants_cross_year"] = bool(payload.get("wants_cross_year"))
+    state.filters["wants_cross_year"] = bool(out.wants_cross_year)
 
     emit(
         EventType.QUERY_CLASSIFIED,
         {
-            "intent": intent.value,
+            "intent": out.intent.value,
             "ticker": state.ticker,
             "company_name": state.company_name,
             "fiscal_year": fiscal_year,
@@ -200,7 +201,6 @@ def plan_retrieval(state: GraphState, ctx: NodeContext) -> GraphState:
     intent = state.intent or ResearchIntent.GENERIC_FILING_QA
     policy = get_policy(intent)
 
-    # Apply user filter overrides
     top_k = state.user_query.top_k or policy.top_k
 
     expanded = state.user_query.query
@@ -279,7 +279,6 @@ def verify_evidence(state: GraphState, ctx: NodeContext) -> GraphState:
         return state
 
     items = state.evidence_items
-    # Deduplicate by source_id keeping the highest-scored
     by_id: dict[str, EvidenceItem] = {}
     for it in items:
         existing = by_id.get(it.source_id)
@@ -288,7 +287,6 @@ def verify_evidence(state: GraphState, ctx: NodeContext) -> GraphState:
 
     deduped = sorted(by_id.values(), key=lambda e: e.relevance_score, reverse=True)
 
-    # Drop very weak candidates
     from app.core.config import settings
 
     filtered = [e for e in deduped if e.relevance_score >= settings.min_evidence_score]
@@ -316,80 +314,124 @@ def verify_evidence(state: GraphState, ctx: NodeContext) -> GraphState:
 @_wrap("generate_report")
 def generate_report(state: GraphState, ctx: NodeContext) -> GraphState:
     if state.refused:
-        state.final_report = _refusal_report(state)
+        state.draft_report = _refusal_report(state)
         emit(EventType.FINAL_REPORT, {"refused": True}, node="generate_report")
         return state
 
-    evidence_block = _format_evidence_for_prompt(state.evidence_items)
+    # GROUNDING: LLM input is exactly (user query, evidence-derived
+    # citation chunks). No external context is supplied.
+    citation_text, num_map = build_citation_corpus(state.evidence_items)
 
-    payload = ctx.llm.chat_json(
-        system=GENERATE_SYSTEM,
-        user=GENERATE_USER_TEMPLATE.format(
-            query=state.user_query.query,
-            intent=(state.intent or ResearchIntent.GENERIC_FILING_QA).value,
-            ticker=state.ticker or "n/a",
-            company=state.company_name or "n/a",
-            evidence_block=evidence_block,
-        ),
+    user_prompt = GENERATE_USER_TEMPLATE.format(
+        query=state.user_query.query,
+        intent=(state.intent or ResearchIntent.GENERIC_FILING_QA).value,
+        ticker=state.ticker or "n/a",
+        company=state.company_name or "n/a",
+        evidence_block=citation_text,
     )
 
-    report = _payload_to_report(payload, state)
-    state.draft_report = report
+    if state.last_validation_issues:
+        feedback = REVISION_FEEDBACK_TEMPLATE.format(
+            issues="\n".join(f"- {x}" for x in state.last_validation_issues)
+        )
+        user_prompt += "\n\n" + feedback
 
-    # Emit per-section markers so the UI can render incrementally
-    for sect_name in ("summary", "key_findings", "financial_metrics", "risk_factors", "management_commentary"):
+    structured = ctx.chat_model.with_structured_output(LLMReportDraft)
+    draft = structured.invoke(
+        [
+            {"role": "system", "content": GENERATE_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+
+    state.draft_report = _build_research_report(draft, state, num_map)
+    # Feedback was consumed by the LLM in this iteration — clear so
+    # validate can decide afresh whether another retry is needed.
+    state.last_validation_issues = []
+
+    for sect_name in (
+        "summary",
+        "key_findings",
+        "financial_metrics",
+        "risk_factors",
+        "management_commentary",
+    ):
         emit(
             EventType.REPORT_SECTION,
-            {"section": sect_name},
+            {"section": sect_name, "revision": state.revision_count},
             node="generate_report",
         )
     return state
 
 
 # ---------------------------------------------------------------------
-# 6. validate_report
+# 6. validate_report — also drives the self-correction loop
 # ---------------------------------------------------------------------
 @_wrap("validate_report")
 def validate_report(state: GraphState, ctx: NodeContext) -> GraphState:
     if state.refused:
+        state.revision_required = False
+        # Refusal flow has the canned report on draft; promote so
+        # format_output / API can return it.
+        if state.final_report is None and state.draft_report is not None:
+            state.final_report = state.draft_report
         return state
 
     draft = state.draft_report
     if draft is None:
         msg = "no draft report to validate"
         state.errors.append(msg)
+        state.revision_required = False
         emit(EventType.ERROR, {"error": msg}, node="validate_report")
         return state
 
-    warnings: list[str] = []
+    issues: list[str] = []
     available_ids = {e.source_id for e in state.evidence_items}
 
-    # 1. Compliance regex check on rendered text
-    rendered = draft.markdown()
-    matches = find_restricted_phrases(rendered)
+    # 1. Compliance regex on rendered text
+    matches = find_restricted_phrases(draft.markdown())
     if matches:
-        warnings.append(
-            "Restricted phrases detected: " + ", ".join(sorted(set(matches)))
-        )
+        issues.append("Restricted phrases: " + ", ".join(sorted(set(matches))))
 
-    # 2. Citation check — every Finding must cite at least one valid evidence_id
+    # 2. Grounding: every Finding must cite at least one evidence_id
     uncited = [f.claim[:80] for f in draft.key_findings if not f.evidence_ids]
     if uncited:
-        warnings.append(
-            f"{len(uncited)} finding(s) lack citations: {uncited[:3]}"
-        )
+        issues.append(f"{len(uncited)} finding(s) without citations: {uncited[:3]}")
+
+    # 3. Grounding: citations must resolve to actually-retrieved evidence
     bogus = [
-        eid for f in draft.key_findings for eid in f.evidence_ids if eid not in available_ids
+        eid
+        for f in draft.key_findings
+        for eid in f.evidence_ids
+        if eid not in available_ids
     ]
     if bogus:
-        warnings.append(
-            f"{len(bogus)} finding citation(s) reference unknown evidence_ids"
-        )
+        issues.append(f"{len(bogus)} citation(s) reference unknown source_ids")
 
-    for w in warnings:
-        emit(EventType.VERIFICATION_WARNING, {"warning": w}, node="validate_report")
+    # Self-correction: route back to generate_report with feedback.
+    if issues and state.revision_count < MAX_REVISIONS:
+        state.revision_count += 1
+        state.revision_required = True
+        state.last_validation_issues = issues
+        for w in issues:
+            emit(
+                EventType.VERIFICATION_WARNING,
+                {"warning": w, "revision": state.revision_count},
+                node="validate_report",
+            )
+        return state
 
-    state.validation_warnings.extend(warnings)
+    # Either issue-free or hit retry cap — accept the draft. Surface any
+    # remaining issues as validation_warnings on the final report.
+    state.revision_required = False
+    if issues:
+        state.validation_warnings.extend(issues)
+        for w in issues:
+            emit(
+                EventType.VERIFICATION_WARNING,
+                {"warning": w, "final": True},
+                node="validate_report",
+            )
     state.final_report = draft
     return state
 
@@ -411,16 +453,10 @@ def format_output(state: GraphState, ctx: NodeContext) -> GraphState:
     if not final:
         return state
 
-    # Attach validation warnings + evidence into the final report
     final.validation_warnings = list(state.validation_warnings)
     final.evidence = state.evidence_items
     state.final_report = final
 
-    # Persist the report row first (evidence_items.report_id has an FK
-    # to research_reports.report_id, so saving evidence before the parent
-    # row would violate the constraint and leave the session in a
-    # rolled-back state — which then crashes the SSE stream's outer
-    # commit with PendingRollbackError).
     if ctx.evidence_store is not None:
         try:
             _persist_report_row(ctx.session, final)
@@ -430,8 +466,6 @@ def format_output(state: GraphState, ctx: NodeContext) -> GraphState:
             ctx.session.commit()
         except Exception as e:
             log.warning("evidence persist failed", err=str(e))
-            # Roll back to clear the failed transaction so subsequent
-            # commits (e.g. session_scope's exit) don't bomb.
             try:
                 ctx.session.rollback()
             except Exception:
@@ -449,13 +483,6 @@ def format_output(state: GraphState, ctx: NodeContext) -> GraphState:
 # Helpers — payload conversion & refusal report
 # ---------------------------------------------------------------------
 def _persist_report_row(session: Session, final: ResearchReport) -> None:
-    """Insert the final report into research_reports if not already there.
-
-    Idempotent on report_id (the column has a unique index, but our
-    workflow only generates a fresh UUID per run so collisions don't
-    happen in practice — this defensive check just keeps things safe
-    if the same workflow is ever re-driven through a checkpoint).
-    """
     from app.db.models import ResearchReportRow
 
     try:
@@ -480,70 +507,57 @@ def _persist_report_row(session: Session, final: ResearchReport) -> None:
     session.flush()
 
 
-def _format_evidence_for_prompt(items: list[EvidenceItem]) -> str:
-    if not items:
-        return "(no evidence retrieved)"
-    parts = []
-    for e in items:
-        parts.append(
-            f"[id={e.source_id} | section={e.section} | page={e.page_start}-{e.page_end}]\n"
-            f"{e.text[:1200]}"
+def _build_research_report(
+    draft: LLMReportDraft,
+    state: GraphState,
+    num_map: dict[int, str],
+) -> ResearchReport:
+    """Translate the LLM-facing ``LLMReportDraft`` into the public
+    :class:`ResearchReport`, mapping every ``evidence_numbers`` to
+    project ``source_id`` strings."""
+
+    findings = [
+        Finding(
+            claim=f.claim,
+            evidence_ids=numbers_to_source_ids(f.evidence_numbers, num_map),
+            confidence=f.confidence or Confidence.MEDIUM,
+            reasoning_summary=f.reasoning_summary,
         )
-    return "\n\n---\n\n".join(parts)
+        for f in draft.key_findings
+        if f.claim
+    ]
 
+    metrics = [
+        FinancialMetric(
+            metric_name=m.metric_name,
+            period=m.period,
+            value=m.value,
+            change=m.change,
+            source_evidence_ids=numbers_to_source_ids(m.evidence_numbers, num_map),
+        )
+        for m in draft.financial_metrics
+        if m.metric_name
+    ]
 
-def _payload_to_report(payload: dict, state: GraphState) -> ResearchReport:
-    try:
-        findings = [
-            Finding(
-                claim=f.get("claim", ""),
-                evidence_ids=list(f.get("evidence_ids") or []),
-                confidence=Confidence(f.get("confidence", "medium")),
-                reasoning_summary=f.get("reasoning_summary"),
-            )
-            for f in payload.get("key_findings", []) or []
-            if f.get("claim")
-        ]
-    except (ValueError, TypeError):
-        findings = []
-
-    try:
-        metrics = [
-            FinancialMetric(
-                metric_name=m.get("metric_name", ""),
-                period=m.get("period"),
-                value=str(m.get("value")) if m.get("value") is not None else None,
-                change=str(m.get("change")) if m.get("change") is not None else None,
-                source_evidence_ids=list(m.get("source_evidence_ids") or []),
-            )
-            for m in payload.get("financial_metrics", []) or []
-            if m.get("metric_name")
-        ]
-    except (ValueError, TypeError):
-        metrics = []
-
-    try:
-        risks = [
-            RiskFactor(
-                risk=r.get("risk", ""),
-                category=r.get("category"),
-                materiality=Materiality(r.get("materiality", "unknown")),
-                evidence_ids=list(r.get("evidence_ids") or []),
-            )
-            for r in payload.get("risk_factors", []) or []
-            if r.get("risk")
-        ]
-    except (ValueError, TypeError):
-        risks = []
+    risks = [
+        RiskFactor(
+            risk=r.risk,
+            category=r.category,
+            materiality=r.materiality or Materiality.UNKNOWN,
+            evidence_ids=numbers_to_source_ids(r.evidence_numbers, num_map),
+        )
+        for r in draft.risk_factors
+        if r.risk
+    ]
 
     commentary = [
         ManagementCommentary(
-            topic=c.get("topic", ""),
-            quote_or_paraphrase=c.get("quote_or_paraphrase", ""),
-            evidence_ids=list(c.get("evidence_ids") or []),
+            topic=c.topic,
+            quote_or_paraphrase=c.quote_or_paraphrase,
+            evidence_ids=numbers_to_source_ids(c.evidence_numbers, num_map),
         )
-        for c in payload.get("management_commentary", []) or []
-        if c.get("topic")
+        for c in draft.management_commentary
+        if c.topic
     ]
 
     intent = state.intent or ResearchIntent.GENERIC_FILING_QA
@@ -553,14 +567,14 @@ def _payload_to_report(payload: dict, state: GraphState) -> ResearchReport:
         ticker=state.ticker,
         company_name=state.company_name,
         intent=intent,
-        summary=payload.get("summary", "").strip()
-        or "Mock summary: the system retrieved evidence and generated a structured outline.",
+        summary=(draft.summary or "").strip()
+        or "The retrieved evidence did not contain enough information to answer the question.",
         key_findings=findings,
         financial_metrics=metrics,
         risk_factors=risks,
         management_commentary=commentary,
         evidence=state.evidence_items,
-        limitations=list(payload.get("limitations") or []),
+        limitations=list(draft.limitations or []),
     )
 
 

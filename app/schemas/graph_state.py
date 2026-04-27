@@ -53,4 +53,11 @@ class GraphState(BaseModel):
 
     # Workflow bookkeeping
     revision_count: int = 0
+    # Set by validate_report when issues warrant a self-correction retry.
+    # The conditional edge in workflow.py routes back to generate_report
+    # when this is True and revision_count is below MAX_REVISIONS.
+    revision_required: bool = False
+    # Issues from the most recent validate pass — handed to generate_report
+    # as feedback on the next iteration, then cleared.
+    last_validation_issues: list[str] = Field(default_factory=list)
     refused: bool = False

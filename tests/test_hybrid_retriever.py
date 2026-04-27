@@ -74,7 +74,7 @@ def test_returns_evidence_items_with_scores(mock_embedding) -> None:
     risk = _doc(CanonicalSection.RISK_FACTORS.value, "macroeconomic risk discussion")
     business = _doc(CanonicalSection.BUSINESS.value, "company makes widgets")
     retriever = HybridRetriever(
-        embedding_service=mock_embedding,
+        embeddings=mock_embedding,
         vector_store=_StubVectorStore([risk, business]),
         fts_retriever=_StubFTSRetriever([risk]),
     )
@@ -99,7 +99,7 @@ def test_fallback_returns_empty_when_no_data(mock_embedding) -> None:
     empty, the retriever degrades to an empty list rather than raising.
     """
     retriever = HybridRetriever(
-        embedding_service=mock_embedding,
+        embeddings=mock_embedding,
         vector_store=_StubVectorStore([]),
         fts_retriever=_StubFTSRetriever([]),
     )
@@ -117,7 +117,7 @@ def test_fallback_returns_empty_when_no_data(mock_embedding) -> None:
 def test_score_breakdown_present(section, mock_embedding) -> None:
     hit = _doc(section, "some text")
     retriever = HybridRetriever(
-        embedding_service=mock_embedding,
+        embeddings=mock_embedding,
         vector_store=_StubVectorStore([hit]),
         fts_retriever=_StubFTSRetriever([]),
     )

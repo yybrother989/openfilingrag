@@ -81,7 +81,7 @@ def reindex_doc(document_id: int, session: Session = Depends(get_db)) -> Ingesti
     session.flush()  # let the pipeline see a clean slate within the same txn
 
     deps = get_workflow_deps()
-    pipeline = IngestionPipeline(embedding_service=deps.embedding)
+    pipeline = IngestionPipeline(embeddings=deps.embeddings)
     try:
         result = pipeline.ingest(raw_path, meta, session)
         session.commit()

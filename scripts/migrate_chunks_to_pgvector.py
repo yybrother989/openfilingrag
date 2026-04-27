@@ -34,7 +34,7 @@ from langchain_core.documents import Document as LCDocument
 
 from app.core.config import settings
 from app.retrieval.pg_vector_store import build_pg_vector
-from app.services.embedding_service import EmbeddingService
+from app.services.models import build_embeddings
 
 
 def _parse_embedding(raw: Any) -> list[float] | None:
@@ -106,8 +106,8 @@ def _row_to_lcdoc(row: Any) -> tuple[LCDocument, list[float] | None, str]:
 
 def main(batch: int = 500, dry_run: bool = False) -> int:
     engine = sa.create_engine(settings.database_url, pool_pre_ping=True)
-    embedding_service = EmbeddingService()
-    vs = build_pg_vector(embedding_service)
+    embeddings = build_embeddings()
+    vs = build_pg_vector(embeddings)
 
     # Make sure langchain_pg_collection / langchain_pg_embedding exist
     # before the operator runs 002_langchain_pgvector.sql Part A.
