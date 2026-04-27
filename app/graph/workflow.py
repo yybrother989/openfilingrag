@@ -4,38 +4,29 @@ A single compiled :class:`StateGraph` is the source of truth for node
 order. Both execution paths run *through* it:
 
 * :func:`run_workflow` — synchronous wrapper around ``graph.invoke``,
-  used by ``POST /research/query`` and tests.
-* :func:`stream_workflow` — async generator that runs ``graph.invoke`` on
-  a thread pool and pipes events out through :class:`EventEmitter` for
-  ``POST /research/stream`` (SSE).
+  used by ``POST /research/query`` and tests. Workflow events emitted
+  via :func:`app.graph.streaming.emit` are silently dropped here (no
+  stream consumer).
+* :func:`stream_workflow` — async generator that drives
+  ``graph.astream`` and translates LangGraph's native ``custom`` /
+  ``values`` channels back into our :class:`AgentEvent` shape for SSE.
 
-Per-run services (DB session, LLM, retriever, cancel signal) are
-injected into nodes via ``RunnableConfig.configurable.node_context``.
-LangGraph wraps every invoke/astream call with its own callback manager,
-so LangSmith tracing kicks in automatically when ``LANGSMITH_API_KEY`` is
-set — no extra wiring needed.
+Per-run services (DB session, chat model, retriever) are injected into
+nodes via ``RunnableConfig.configurable.node_context``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import threading
 import uuid
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from app.core.logging import get_logger
 from app.schemas.events import AgentEvent, EventType
 from app.schemas.graph_state import GraphState
 from app.schemas.query import ResearchQuery
-from app.schemas.report import ResearchReport
 
-from .event_emitter import (
-    EventEmitter,
-    reset_current_emitter,
-    set_current_emitter,
-)
 from .nodes import (
     NodeContext,
     classify_query,
@@ -138,63 +129,28 @@ def run_workflow(
     chat_model: "BaseChatModel",
     retriever: "HybridRetriever",
     evidence_store: "EvidenceStore | None" = None,
-    emitter: EventEmitter | None = None,
-    cancel_event: threading.Event | None = None,
 ) -> GraphState:
-    """Execute the workflow via LangGraph and return the final state.
+    """Execute the workflow via ``graph.invoke`` and return the final state.
 
-    Used directly by ``POST /research/query`` and tests. If ``emitter``
-    is provided, nodes can emit events to it via the contextvar-bound
-    :func:`app.graph.event_emitter.emit` helper. Cancellation is
-    cooperative — set ``cancel_event`` to ask the workflow to stop
-    between nodes (the current node finishes; subsequent ones short-
-    circuit in their ``_wrap`` decorator).
+    Used directly by ``POST /research/query`` and tests. Streaming
+    events are no-ops because there is no stream consumer attached.
     """
-    cancel = cancel_event or threading.Event()
     state = GraphState(user_query=query)
     ctx = NodeContext(
         session=session,
         chat_model=chat_model,
         retriever=retriever,
         evidence_store=evidence_store,
-        cancel_event=cancel,
     )
     config = {"configurable": {"node_context": ctx}}
 
-    token = set_current_emitter(emitter) if emitter else None
     try:
-        if emitter:
-            emitter.emit(
-                EventType.RUN_STARTED,
-                {"query": query.query, "ticker": query.ticker},
-            )
-
-        try:
-            result = get_graph().invoke(state, config)
-            final_state = _coerce_state(result, state)
-        except Exception as e:
-            log.exception("workflow.invoke failed", err=str(e))
-            state.errors.append(f"workflow: {e}")
-            final_state = state
-
-        if emitter:
-            if cancel.is_set():
-                emitter.emit(EventType.RUN_COMPLETED, {"cancelled": True})
-            else:
-                emitter.emit(
-                    EventType.RUN_COMPLETED,
-                    {
-                        "report_id": final_state.final_report.report_id
-                        if final_state.final_report
-                        else None,
-                        "errors": final_state.errors,
-                        "warnings": final_state.validation_warnings,
-                    },
-                )
-    finally:
-        if token is not None:
-            reset_current_emitter(token)
-    return final_state
+        result = get_graph().invoke(state, config)
+        return _coerce_state(result, state)
+    except Exception as e:
+        log.exception("workflow.invoke failed", err=str(e))
+        state.errors.append(f"workflow: {e}")
+        return state
 
 
 # ---------------------------------------------------------------------
@@ -208,53 +164,88 @@ async def stream_workflow(
     retriever: "HybridRetriever",
     evidence_store: "EvidenceStore | None" = None,
     thread_id: str | None = None,
-    cancel_event: threading.Event | None = None,
 ) -> AsyncIterator[AgentEvent]:
-    """Yield :class:`AgentEvent`s as the workflow runs.
+    """Drive ``graph.astream`` and yield :class:`AgentEvent`s.
 
-    LangGraph's :class:`StateGraph` is the executor; we run
-    ``graph.invoke`` on a worker thread and let nodes pump events back
-    via :class:`EventEmitter` (which they reach through the
-    contextvar-bound module-level :func:`emit` helper). Pass
-    ``cancel_event`` to allow the caller — typically the SSE endpoint's
-    disconnect watcher — to ask the workflow to stop between nodes.
+    Cancellation is asyncio-native: cancelling the consumer task
+    propagates into ``astream`` and stops the graph between nodes.
+    In-flight nodes (typically a sync LLM call) still finish.
     """
     run_id = str(uuid.uuid4())
-    loop = asyncio.get_running_loop()
-    emitter = EventEmitter(loop=loop, run_id=run_id, thread_id=thread_id)
-    cancel = cancel_event or threading.Event()
+    state = GraphState(user_query=query)
+    ctx = NodeContext(
+        session=session,
+        chat_model=chat_model,
+        retriever=retriever,
+        evidence_store=evidence_store,
+    )
+    config = {"configurable": {"node_context": ctx, "thread_id": thread_id}}
 
-    def _runner() -> ResearchReport | None:
-        try:
-            final_state = run_workflow(
-                query,
-                session=session,
-                chat_model=chat_model,
-                retriever=retriever,
-                evidence_store=evidence_store,
-                emitter=emitter,
-                cancel_event=cancel,
-            )
-            return final_state.final_report
-        finally:
-            emitter.close()
+    yield AgentEvent(
+        run_id=run_id,
+        thread_id=thread_id,
+        type=EventType.RUN_STARTED,
+        payload={"query": query.query, "ticker": query.ticker},
+    )
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut = loop.run_in_executor(pool, _runner)
-        try:
-            async for evt in emitter.stream():
-                yield evt
-        except (asyncio.CancelledError, GeneratorExit):
-            cancel.set()
-            emitter.close()
-            raise
-        try:
-            await fut
-        except Exception as e:
-            err = AgentEvent(
-                run_id=run_id,
-                thread_id=thread_id,
-                type=EventType.ERROR,
-                payload={"error": str(e)},
-            )
-            yield err
+    final_state: GraphState = state
+    cancelled = False
+    try:
+        async for mode, chunk in get_graph().astream(
+            state,
+            config,
+            stream_mode=["custom", "values"],
+        ):
+            if mode == "custom":
+                # Re-hydrate AgentEvent from the writer payload that
+                # streaming.emit() produced inside the node.
+                try:
+                    evt_type = EventType(chunk.get("event"))
+                except ValueError:
+                    log.warning("unknown event type in stream", event=chunk.get("event"))
+                    continue
+                yield AgentEvent(
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    type=evt_type,
+                    node=chunk.get("node"),
+                    payload=chunk.get("payload") or {},
+                )
+            elif mode == "values":
+                # Last "values" chunk is the final GraphState snapshot.
+                final_state = _coerce_state(chunk, state)
+    except (asyncio.CancelledError, GeneratorExit):
+        cancelled = True
+        # Surface the cancellation as a final event before re-raising so
+        # the SSE consumer sees a clean close.
+        yield AgentEvent(
+            run_id=run_id,
+            thread_id=thread_id,
+            type=EventType.RUN_COMPLETED,
+            payload={"cancelled": True},
+        )
+        raise
+    except Exception as e:
+        log.exception("astream failed", err=str(e))
+        yield AgentEvent(
+            run_id=run_id,
+            thread_id=thread_id,
+            type=EventType.ERROR,
+            payload={"error": str(e)},
+        )
+
+    if not cancelled:
+        yield AgentEvent(
+            run_id=run_id,
+            thread_id=thread_id,
+            type=EventType.RUN_COMPLETED,
+            payload={
+                "report_id": (
+                    final_state.final_report.report_id
+                    if final_state.final_report
+                    else None
+                ),
+                "errors": list(final_state.errors),
+                "warnings": list(final_state.validation_warnings),
+            },
+        )

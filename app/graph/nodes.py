@@ -12,10 +12,9 @@ unit-tested with stubs.
 
 from __future__ import annotations
 
-import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
@@ -36,7 +35,6 @@ from app.schemas.report import (
 )
 
 from .citations import build_citation_corpus, numbers_to_source_ids
-from .event_emitter import emit
 from .llm_schemas import (
     LLMClassifyOutput,
     LLMReportDraft,
@@ -54,6 +52,7 @@ from .prompts import (
     GENERATE_USER_TEMPLATE,
     REVISION_FEEDBACK_TEMPLATE,
 )
+from .streaming import emit
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -78,10 +77,6 @@ class NodeContext:
     chat_model: "BaseChatModel"
     retriever: "HybridRetriever"
     evidence_store: "EvidenceStore | None" = None
-    # Cooperative cancellation: workflow loop checks this between nodes;
-    # _wrap also short-circuits if it's set so a node never starts work
-    # after the client has gone away.
-    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 def make_langgraph_adapter(node_name: str, fn):
@@ -103,8 +98,6 @@ def _wrap(node_name: str):
 
     def decorator(fn):
         def wrapper(state: GraphState, ctx: NodeContext) -> GraphState:
-            if ctx.cancel_event.is_set():
-                return state
             t0 = time.perf_counter()
             emit(EventType.NODE_START, {"node": node_name}, node=node_name)
             try:

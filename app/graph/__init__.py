@@ -1,6 +1,5 @@
 """LangGraph workflow + event emission."""
 
-from .event_emitter import EventEmitter, emit, get_current_emitter
 from .nodes import (
     NodeContext,
     classify_query,
@@ -20,13 +19,13 @@ from .policies import (
     get_policy,
     is_advice_query,
 )
+from .streaming import emit
 from .workflow import build_langgraph, run_workflow, stream_workflow
 
 __all__ = [
     "INTENT_POLICIES",
     "REFUSAL_MESSAGE",
     "RESTRICTED_PATTERNS",
-    "EventEmitter",
     "NodeContext",
     "RetrievalPolicy",
     "build_langgraph",
@@ -35,7 +34,6 @@ __all__ = [
     "find_restricted_phrases",
     "format_output",
     "generate_report",
-    "get_current_emitter",
     "get_policy",
     "is_advice_query",
     "plan_retrieval",
