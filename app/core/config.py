@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     default_top_k: int = Field(default=12, ge=1, le=100)
     min_evidence_score: float = Field(default=0.05, ge=0.0, le=1.0)
 
+    # --- cross-encoder reranker (Phase 3) ---
+    reranker_enabled: bool = False
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_top_n: int = Field(default=10, ge=1, le=100)
+    # Pool size handed to the cross-encoder. Bigger = better recall after
+    # reranking, but each pair costs ~5–20 ms on CPU. 30–40 is a sane
+    # default for an interactive query.
+    reranker_pool_k: int = Field(default=30, ge=1, le=200)
+
     @field_validator("log_level")
     @classmethod
     def _upper_log_level(cls, v: str) -> str:

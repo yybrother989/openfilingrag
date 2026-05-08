@@ -8,8 +8,6 @@ evidence found, verification warnings, final report) in real time.
 from __future__ import annotations
 
 import asyncio
-import json
-import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -41,7 +39,7 @@ def research_query(
     state = run_workflow(
         body,
         session=session,
-        llm=deps.llm,
+        chat_model=deps.chat_model,
         retriever=deps.retriever,
         evidence_store=deps.evidence_store,
     )
@@ -103,43 +101,27 @@ async def research_stream(body: ResearchQuery, request: Request) -> StreamingRes
         )
 
     async def event_generator():
-        cancel_event = threading.Event()
-
-        async def disconnect_watcher() -> None:
-            # Poll even when no events flow — a long LLM call would
-            # otherwise let the client sit disconnected for ~30s while
-            # we keep burning tokens.
-            try:
-                while not cancel_event.is_set():
-                    if await request.is_disconnected():
-                        log.info("client disconnected, signalling cancel")
-                        cancel_event.set()
-                        return
-                    await asyncio.sleep(0.5)
-            except asyncio.CancelledError:
-                pass
-
-        watcher = asyncio.create_task(disconnect_watcher())
+        # FastAPI cancels this generator when the client disconnects;
+        # the cancellation propagates into stream_workflow's astream
+        # and stops the graph between nodes. We additionally probe
+        # request.is_disconnected() between events so an in-flight node
+        # finishing doesn't leak a token send to a dead socket.
         with session_scope() as session:
             try:
                 async for event in stream_workflow(
                     body,
                     session=session,
-                    llm=deps.llm,
+                    chat_model=deps.chat_model,
                     retriever=deps.retriever,
                     evidence_store=deps.evidence_store,
-                    cancel_event=cancel_event,
                 ):
-                    if cancel_event.is_set():
+                    if await request.is_disconnected():
+                        log.info("client disconnected mid-stream")
                         return
                     yield event.to_sse()
             except asyncio.CancelledError:
                 log.info("stream cancelled")
-                cancel_event.set()
                 raise
-            finally:
-                cancel_event.set()
-                watcher.cancel()
 
     headers = {
         "Cache-Control": "no-cache",

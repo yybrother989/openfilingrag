@@ -34,7 +34,7 @@ from app.schemas.document import (
 )
 
 if TYPE_CHECKING:
-    from app.services.embedding_service import EmbeddingService
+    from langchain_core.embeddings import Embeddings
 
 log = get_logger(__name__)
 
@@ -66,14 +66,14 @@ class EdgarIngestService:
 
     def __init__(
         self,
-        embedding_service: "EmbeddingService",
+        embeddings: "Embeddings",
         edgar_client: SECEdgarClient | None = None,
         pipeline: IngestionPipeline | None = None,
         filings_dir: Path | None = None,
     ) -> None:
-        self.embedding_service = embedding_service
+        self.embeddings = embeddings
         self.edgar = edgar_client or SECEdgarClient()
-        self.pipeline = pipeline or IngestionPipeline(embedding_service=embedding_service)
+        self.pipeline = pipeline or IngestionPipeline(embeddings=embeddings)
         self.filings_dir = filings_dir or Path(settings.sec_edgar_filings_dir)
 
     # ------------------------------------------------------------------

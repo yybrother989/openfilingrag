@@ -1,8 +1,6 @@
-"""Metadata filter must produce the expected SQL clauses."""
+"""MetadataFilter must produce the expected PGVector dict filter."""
 
 from __future__ import annotations
-
-from sqlalchemy.dialects import postgresql
 
 from app.retrieval.metadata_filter import (
     MetadataFilter,
@@ -15,13 +13,13 @@ from app.schemas.graph_state import RetrievalPlan
 from app.schemas.query import ResearchIntent, ResearchQuery
 
 
-def _compile(clause) -> str:
-    return str(
-        clause.compile(
-            dialect=postgresql.dialect(),
-            compile_kwargs={"literal_binds": True},
-        )
-    )
+def _flatten(filt: dict | None) -> list[dict]:
+    """Return the leaf clauses regardless of $and wrapping."""
+    if filt is None:
+        return []
+    if "$and" in filt:
+        return list(filt["$and"])
+    return [filt]
 
 
 def test_ticker_year_doctype_constraints_present() -> None:
@@ -32,13 +30,16 @@ def test_ticker_year_doctype_constraints_present() -> None:
         document_type=DocumentType.TEN_K,
         document_ids=[9, 2, 9],
     )
-    where = MetadataFilter.build(q).to_sqlalchemy()
+    where = MetadataFilter.build(q).to_pgvector_filter()
     assert where is not None
-    rendered = _compile(where).lower()
-    assert "ticker = 'acme'" in rendered
-    assert "fiscal_year = 2025" in rendered
-    assert "document_type = '10-k'" in rendered
-    assert "document_id in (2, 9)" in rendered
+    leaves = _flatten(where)
+    # ResearchQuery normalizes ticker to uppercase
+    assert {"ticker": {"$eq": "ACME"}} in leaves
+    assert {"fiscal_year": {"$eq": 2025}} in leaves
+    assert {"document_type": {"$eq": "10-K"}} in leaves
+    # Pydantic dedupes/sorts document_ids before reaching MetadataFilter
+    doc_ids_clause = next(c for c in leaves if "document_id" in c)
+    assert sorted(doc_ids_clause["document_id"]["$in"]) == [2, 9]
 
 
 def test_plan_adds_section_filter() -> None:
@@ -47,17 +48,21 @@ def test_plan_adds_section_filter() -> None:
         intent=ResearchIntent.RISK_ANALYSIS,
         preferred_sections=[CanonicalSection.RISK_FACTORS.value],
     )
-    where = MetadataFilter.build(q, plan).to_sqlalchemy()
-    rendered = _compile(where).lower()
-    assert "in ('risk factors')" in rendered or "in ('risk factors'::" in rendered
+    where = MetadataFilter.build(q, plan).to_pgvector_filter()
+    leaves = _flatten(where)
+    assert {"section": {"$in": ["Risk Factors"]}} in leaves
 
 
 def test_relaxed_drops_section_filter() -> None:
     q = ResearchQuery(query="risks", ticker="ACME")
-    relaxed = MetadataFilter.relaxed(q).to_sqlalchemy()
+    relaxed = MetadataFilter.relaxed(q).to_pgvector_filter()
     assert relaxed is not None
-    rendered = _compile(relaxed).lower()
-    assert "section" not in rendered
+    # No section / document_type clauses
+    leaves = _flatten(relaxed)
+    keys = {next(iter(leaf)) for leaf in leaves}
+    assert "section" not in keys
+    assert "document_type" not in keys
+    assert "ticker" in keys
 
 
 def test_section_match_scoring() -> None:

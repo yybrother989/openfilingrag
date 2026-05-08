@@ -80,7 +80,7 @@ async def ingest_document(
             raise HTTPException(status_code=400, detail=f"local_path does not exist: {local_path}")
 
     deps = get_workflow_deps()
-    pipeline = IngestionPipeline(embedding_service=deps.embedding)
+    pipeline = IngestionPipeline(embeddings=deps.embeddings)
     try:
         result = pipeline.ingest(input_path, meta, session)
         session.commit()

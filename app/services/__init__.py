@@ -1,21 +1,14 @@
 """Service layer: thin orchestration helpers used by API routes and graph nodes."""
 
 from .company_enrichment import CompanyEnrichmentService
-from .embedding_service import EmbeddingService, HashEmbedder, OpenAIEmbedder
-from .llm_service import (
-    AnthropicProvider,
-    LLMService,
-    MockProvider,
-    OpenAIProvider,
-)
+from .mock_chat_model import MockChatModel
+from .mock_embeddings import HashEmbeddings
+from .models import build_chat_model, build_embeddings
 
 __all__ = [
-    "AnthropicProvider",
     "CompanyEnrichmentService",
-    "EmbeddingService",
-    "HashEmbedder",
-    "LLMService",
-    "MockProvider",
-    "OpenAIEmbedder",
-    "OpenAIProvider",
+    "HashEmbeddings",
+    "MockChatModel",
+    "build_chat_model",
+    "build_embeddings",
 ]

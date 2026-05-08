@@ -1,26 +1,42 @@
-"""Build SQLAlchemy filter clauses from a research query + retrieval plan."""
+"""Build a PGVector-compatible filter dict from a research query + plan.
+
+Output shape uses PGVector's documented operators (use_jsonb=True):
+
+    {"$and": [
+        {"ticker":        {"$eq":  "AAPL"}},
+        {"fiscal_year":   {"$eq":  2024}},
+        {"document_type": {"$in":  ["10-K", "10-Q"]}},
+        {"section":       {"$in":  ["Risk Factors", "MD&A"]}},
+    ]}
+
+Both :class:`langchain_postgres.PGVector` and our
+:class:`PGFTSRetriever` accept this same dict shape, so the hybrid
+retriever can pass one filter to both legs.
+
+The score helpers below return ``[0,1]`` weights consumed by
+:class:`HybridRetriever` after fusion — they're not part of the SQL
+filter, just secondary signals layered onto the RRF text score.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
-from sqlalchemy import ColumnElement, and_, or_
-
-from app.db.models import DocumentChunk
 from app.schemas.graph_state import RetrievalPlan
 from app.schemas.query import ResearchQuery
 
 
 @dataclass
 class MetadataFilter:
-    """Encapsulates the WHERE-clause logic so unit tests can introspect it."""
+    clauses: list[dict[str, Any]] = field(default_factory=list)
 
-    where: list[ColumnElement] | None = None
-
-    def to_sqlalchemy(self) -> ColumnElement | None:
-        if not self.where:
+    def to_pgvector_filter(self) -> dict[str, Any] | None:
+        if not self.clauses:
             return None
-        return and_(*self.where)
+        if len(self.clauses) == 1:
+            return self.clauses[0]
+        return {"$and": list(self.clauses)}
 
     @classmethod
     def build(
@@ -28,47 +44,48 @@ class MetadataFilter:
         query: ResearchQuery,
         plan: RetrievalPlan | None = None,
     ) -> "MetadataFilter":
-        clauses: list[ColumnElement] = []
+        clauses: list[dict[str, Any]] = []
 
         if query.ticker:
-            clauses.append(DocumentChunk.ticker == query.ticker)
+            clauses.append({"ticker": {"$eq": query.ticker}})
         if query.fiscal_year:
-            clauses.append(DocumentChunk.fiscal_year == query.fiscal_year)
+            clauses.append({"fiscal_year": {"$eq": query.fiscal_year}})
         if query.document_type:
-            clauses.append(DocumentChunk.document_type == query.document_type.value)
+            clauses.append({"document_type": {"$eq": query.document_type.value}})
         if query.document_ids:
-            clauses.append(DocumentChunk.document_id.in_(query.document_ids))
+            clauses.append({"document_id": {"$in": list(query.document_ids)}})
 
         if plan:
             if plan.preferred_sections:
-                clauses.append(DocumentChunk.section.in_(plan.preferred_sections))
-            if plan.preferred_document_types:
-                # Override only if user didn't pin a doc type
-                if not query.document_type:
-                    clauses.append(DocumentChunk.document_type.in_(plan.preferred_document_types))
+                clauses.append({"section": {"$in": list(plan.preferred_sections)}})
+            if plan.preferred_document_types and not query.document_type:
+                clauses.append(
+                    {"document_type": {"$in": list(plan.preferred_document_types)}}
+                )
             if plan.fiscal_years and not query.fiscal_year:
-                clauses.append(DocumentChunk.fiscal_year.in_(plan.fiscal_years))
+                clauses.append({"fiscal_year": {"$in": list(plan.fiscal_years)}})
 
-        return cls(where=clauses or None)
+        return cls(clauses=clauses)
 
     @classmethod
     def relaxed(cls, query: ResearchQuery) -> "MetadataFilter":
-        """Same as build() but drops section/content_type/document-type
-        constraints — used by the hybrid retriever as a fallback when the
-        strict filter returns too few hits.
+        """Same as build() but drops section / document-type / plan
+        constraints. Used by HybridRetriever as a fallback when the
+        strict filter returns no hits.
         """
-        clauses: list[ColumnElement] = []
+        clauses: list[dict[str, Any]] = []
         if query.ticker:
-            clauses.append(DocumentChunk.ticker == query.ticker)
+            clauses.append({"ticker": {"$eq": query.ticker}})
         if query.fiscal_year:
-            clauses.append(DocumentChunk.fiscal_year == query.fiscal_year)
+            clauses.append({"fiscal_year": {"$eq": query.fiscal_year}})
         if query.document_ids:
-            clauses.append(DocumentChunk.document_id.in_(query.document_ids))
-        return cls(where=clauses or None)
+            clauses.append({"document_id": {"$in": list(query.document_ids)}})
+        return cls(clauses=clauses)
 
+
+# ---- secondary scoring signals (consumed after RRF fusion) ------------
 
 def section_match_score(plan: RetrievalPlan | None, section: str) -> float:
-    """Return [0,1] indicating how well a chunk's section matches the plan."""
     if not plan or not plan.preferred_sections:
         return 0.0
     return 1.0 if section in plan.preferred_sections else 0.0
@@ -81,7 +98,6 @@ def content_type_match_score(plan: RetrievalPlan | None, content_type: str) -> f
 
 
 def source_priority_score(source_priority: str) -> float:
-    """Map source_priority to a [0,1] preference weight."""
     return {
         "primary_filing": 1.0,
         "company_presentation": 0.7,
@@ -92,7 +108,6 @@ def source_priority_score(source_priority: str) -> float:
 
 
 def recency_score(filing_year: int | None, today_year: int = 2026) -> float:
-    """Newer filings score closer to 1.0; very old ones decay toward 0."""
     if filing_year is None:
         return 0.5
     delta = max(today_year - filing_year, 0)

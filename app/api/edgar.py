@@ -32,7 +32,7 @@ def list_filings(
 ) -> dict:
     """Preview which filings EDGAR has for this ticker, without ingesting."""
     deps = get_workflow_deps()
-    service = EdgarIngestService(embedding_service=deps.embedding)
+    service = EdgarIngestService(embeddings=deps.embeddings)
     type_tuple = tuple(t.strip().upper() for t in types.split(",") if t.strip())
     refs = service.list_filings(ticker, type_tuple, limit=limit)
     if not refs:
@@ -58,7 +58,7 @@ def pull_filings(
 ) -> dict:
     """Fetch + ingest filings for a ticker. Idempotent (dedupes by source URL)."""
     deps = get_workflow_deps()
-    service = EdgarIngestService(embedding_service=deps.embedding)
+    service = EdgarIngestService(embeddings=deps.embeddings)
     summary = service.pull_and_ingest(
         ticker=body.ticker,
         session=session,

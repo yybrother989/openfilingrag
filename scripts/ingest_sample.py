@@ -74,7 +74,7 @@ def main() -> None:
     )
 
     deps = get_workflow_deps()
-    pipeline = IngestionPipeline(embedding_service=deps.embedding)
+    pipeline = IngestionPipeline(embeddings=deps.embeddings)
     with session_scope() as session:
         result = pipeline.ingest(target, meta, session)
     log.info(

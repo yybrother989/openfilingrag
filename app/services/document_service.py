@@ -115,6 +115,8 @@ def list_local_files() -> list[LocalFileEntry]:
 
 
 def _to_out(doc: Document) -> DocumentOut:
+    # chunks_count is no longer carried on Document — chunks live in
+    # PGVector (langchain_pg_embedding) keyed by document_id metadata.
     return DocumentOut.model_validate(
         {
             "id": doc.id,
@@ -127,7 +129,7 @@ def _to_out(doc: Document) -> DocumentOut:
             "source_priority": doc.source_priority,
             "page_count": doc.page_count,
             "sections_count": len(doc.sections) if doc.sections is not None else None,
-            "chunks_count": len(doc.chunks) if doc.chunks is not None else None,
+            "chunks_count": None,
             "tables_count": len(doc.tables) if doc.tables is not None else None,
             "raw_path": doc.raw_path,
             "created_at": doc.created_at,

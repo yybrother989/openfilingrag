@@ -1,42 +1,40 @@
-"""Hybrid retriever combining metadata, keyword, and vector signals.
+"""Hybrid retriever combining PGVector + Postgres FTS via Reciprocal
+Rank Fusion (Cormack et al. 2009).
 
-Text relevance is fused via Reciprocal Rank Fusion (Cormack et al. 2009),
-which is invariant to the underlying score scales — vector cosine
-similarity and ``ts_rank_cd`` aren't directly comparable, so per-result-
-set min-max scaling drifted from query to query. RRF only needs the
-ranks::
+Vector cosine similarity and ``ts_rank_cd`` aren't directly comparable,
+so we fuse on **rank** rather than raw scores::
 
     rrf(rank, k=60) = 1 / (k + rank)
-    text_score      = rrf(vector_rank) + rrf(keyword_rank)   # one or both
+    text_score      = rrf(vector_rank) + rrf(keyword_rank)   # normalized
 
-The text_score is normalized to [0, 1] (max possible is two top-1 hits)
-and then combined with the metadata signals::
+Final score adds metadata signals layered onto the text score::
 
     score = 0.75 * text
-          + 0.10 * section_match
+          + 0.10 * section_match (or content_type bonus, whichever higher)
           + 0.10 * source_priority
           + 0.05 * recency
 
-The per-component ``score_breakdown`` is preserved so the UI can still
-explain *why* a chunk was retrieved — ``vector`` and ``keyword`` now
-report the chunk's RRF contribution from each ranker (0 if absent).
+The per-component breakdown is preserved in ``EvidenceItem.score_breakdown``
+for UI explainability ("strong semantic match; preferred section…").
 """
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import date as date_cls
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy.orm import Session
+import sqlalchemy as sa
+from langchain_core.documents import Document
 
+from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.models import DocumentChunk
 from app.schemas.document import ContentType, DocumentType, SourcePriority
 from app.schemas.evidence import EvidenceItem
 from app.schemas.graph_state import RetrievalPlan
 from app.schemas.query import ResearchQuery
 
-from .keyword_search import KeywordSearch
 from .metadata_filter import (
     MetadataFilter,
     content_type_match_score,
@@ -44,10 +42,13 @@ from .metadata_filter import (
     section_match_score,
     source_priority_score,
 )
-from .vector_store import VectorStore
+from .pg_fts_retriever import PGFTSRetriever
+from .pg_vector_store import build_pg_vector
+from .reranker import FilingsReranker
 
 if TYPE_CHECKING:
-    from app.services.embedding_service import EmbeddingService
+    from langchain_core.embeddings import Embeddings
+    from langchain_postgres import PGVector
 
 log = get_logger(__name__)
 
@@ -58,89 +59,134 @@ _RRF_MAX = 2.0 / (RRF_K + 1)  # both rankers' top hit
 
 @dataclass
 class HybridWeights:
-    text: float = 0.75  # combined RRF(vector) + RRF(keyword), normalized
+    text: float = 0.75
     section: float = 0.10
     source: float = 0.10
     recency: float = 0.05
 
 
 class HybridRetriever:
+    """PGVector + PGFTSRetriever, fused with RRF + metadata weights."""
+
     def __init__(
         self,
-        embedding_service: "EmbeddingService",
-        vector_store: VectorStore | None = None,
-        keyword_search: KeywordSearch | None = None,
+        embeddings: "Embeddings",
+        vector_store: "PGVector | None" = None,
+        fts_retriever: PGFTSRetriever | None = None,
         weights: HybridWeights | None = None,
+        reranker: FilingsReranker | None = None,
     ) -> None:
-        self.embedding_service = embedding_service
-        self.vector_store = vector_store or VectorStore()
-        self.keyword_search = keyword_search or KeywordSearch()
+        self.embeddings = embeddings
+        self._vector_store = vector_store
+        self._fts_retriever = fts_retriever
         self.w = weights or HybridWeights()
+        self.reranker = reranker or FilingsReranker()
 
-    # ------------------------------------------------------------------
-    # Main API
-    # ------------------------------------------------------------------
+    # -- lazy backends ---------------------------------------------------
+    @property
+    def vector_store(self) -> "PGVector":
+        if self._vector_store is None:
+            self._vector_store = build_pg_vector(self.embeddings)
+        return self._vector_store
+
+    def _build_fts(self, *, k: int, filt: dict[str, Any] | None) -> PGFTSRetriever:
+        if self._fts_retriever is not None:
+            # Test injection: caller controls k/filter via the stub itself.
+            return self._fts_retriever
+        # Reuse PGVector's underlying engine if available (avoids opening
+        # a second pool); fall back to a fresh engine from settings.
+        engine = getattr(self.vector_store, "_async_engine", None) or getattr(
+            self.vector_store, "_engine", None
+        )
+        if engine is None or isinstance(engine, sa.ext.asyncio.AsyncEngine):
+            engine = sa.create_engine(settings.database_url, pool_pre_ping=True)
+        # Scope to this PGVector's collection so cross-project tables stay isolated.
+        collection_id = self._collection_id()
+        return PGFTSRetriever(
+            engine=engine,
+            collection_id=collection_id,
+            k=k,
+            filter=filt,
+        )
+
+    def _collection_id(self) -> Any | None:
+        """Return the UUID of the PGVector collection if it has been
+        created. Returns ``None`` if the collection lookup fails (e.g.
+        before any docs have been indexed)."""
+        try:
+            collection = self.vector_store.get_collection(
+                self.vector_store.session_maker()
+            )
+            return collection.uuid if collection else None
+        except Exception:
+            return None
+
+    # -- main API --------------------------------------------------------
     def retrieve(
         self,
-        session: Session,
         query: ResearchQuery,
         plan: RetrievalPlan | None = None,
         k: int | None = None,
     ) -> list[EvidenceItem]:
         top_k = k or (plan.top_k if plan else None) or 12
-        filt = MetadataFilter.build(query, plan).to_sqlalchemy()
+        filt = MetadataFilter.build(query, plan).to_pgvector_filter()
 
-        # Vector search uses the *expanded* query when the planner provides one
         vec_query_text = (plan.expanded_query if plan and plan.expanded_query else query.query)
-        embedding = self.embedding_service.embed_query(vec_query_text)
+        vec_docs = self.vector_store.similarity_search(
+            vec_query_text, k=top_k * 4, filter=filt
+        )
+        kw_docs = self._build_fts(k=top_k * 4, filt=filt).invoke(query.query)
 
-        vec_hits = self.vector_store.search(session, embedding, where=filt, k=top_k * 4)
-        kw_hits = self.keyword_search.search(session, query.query, where=filt, k=top_k * 4)
-
-        # Fallback: if the strict filter wiped out results, retry with
-        # ticker-only filter so we never return zero on a real corpus.
-        if not vec_hits and not kw_hits:
+        if not vec_docs and not kw_docs:
             log.info("hybrid retriever: strict filter empty — falling back to relaxed")
-            relaxed = MetadataFilter.relaxed(query).to_sqlalchemy()
-            vec_hits = self.vector_store.search(session, embedding, where=relaxed, k=top_k * 4)
-            kw_hits = self.keyword_search.search(session, query.query, where=relaxed, k=top_k * 4)
+            relaxed = MetadataFilter.relaxed(query).to_pgvector_filter()
+            vec_docs = self.vector_store.similarity_search(
+                vec_query_text, k=top_k * 4, filter=relaxed
+            )
+            kw_docs = self._build_fts(k=top_k * 4, filt=relaxed).invoke(query.query)
 
-        return self._fuse(vec_hits, kw_hits, plan, top_k)
+        # When the reranker is enabled we surface a larger pool from
+        # fusion so the cross-encoder has more candidates to reorder.
+        # With reranker disabled this collapses to the previous flow.
+        pool_size = max(top_k, self.reranker.pool_k) if self.reranker.enabled else top_k
+        fused = self._fuse(vec_docs, kw_docs, plan, pool_size)
+        if not self.reranker.enabled:
+            return fused[:top_k]
+        return self.reranker.rerank(query.query, fused, top_n=top_k)
 
-    # ------------------------------------------------------------------
-    # Score fusion
-    # ------------------------------------------------------------------
+    # -- fusion ----------------------------------------------------------
     def _fuse(
         self,
-        vec_hits: list[tuple[DocumentChunk, float]],
-        kw_hits: list[tuple[DocumentChunk, float]],
+        vec_docs: list[Document],
+        kw_docs: list[Document],
         plan: RetrievalPlan | None,
         top_k: int,
     ) -> list[EvidenceItem]:
-        # Rank lookups for RRF — rankers must arrive pre-sorted by their
-        # own relevance, which both VectorStore and KeywordSearch do.
-        vec_rank = {c.id: i + 1 for i, (c, _) in enumerate(vec_hits)}
-        kw_rank = {c.id: i + 1 for i, (c, _) in enumerate(kw_hits)}
+        # Use source_id (the project-stable UUID we wrote into metadata)
+        # as the merge key. Falls back to LangChain doc id if missing.
+        vec_rank = {self._key(d): i + 1 for i, d in enumerate(vec_docs)}
+        kw_rank = {self._key(d): i + 1 for i, d in enumerate(kw_docs)}
 
-        chunk_map: dict[int, DocumentChunk] = {}
-        for c, _ in vec_hits:
-            chunk_map[c.id] = c
-        for c, _ in kw_hits:
-            chunk_map.setdefault(c.id, c)
+        doc_map: dict[str, Document] = {}
+        for d in vec_docs:
+            doc_map[self._key(d)] = d
+        for d in kw_docs:
+            doc_map.setdefault(self._key(d), d)
 
         scored: list[EvidenceItem] = []
-        for cid, chunk in chunk_map.items():
-            v_rrf = 1.0 / (RRF_K + vec_rank[cid]) if cid in vec_rank else 0.0
-            kw_rrf = 1.0 / (RRF_K + kw_rank[cid]) if cid in kw_rank else 0.0
+        for key, doc in doc_map.items():
+            v_rrf = 1.0 / (RRF_K + vec_rank[key]) if key in vec_rank else 0.0
+            kw_rrf = 1.0 / (RRF_K + kw_rank[key]) if key in kw_rank else 0.0
             text_norm = (v_rrf + kw_rrf) / _RRF_MAX
 
-            sec = section_match_score(plan, chunk.section)
-            ct = content_type_match_score(plan, chunk.content_type)
-            src = source_priority_score(chunk.source_priority)
-            rec = recency_score(chunk.fiscal_year)
-
-            # Mix section + content-type bonus into the section signal
+            md = doc.metadata or {}
+            section = md.get("section", "") or ""
+            content_type = md.get("content_type", "paragraph") or "paragraph"
+            sec = section_match_score(plan, section)
+            ct = content_type_match_score(plan, content_type)
             section_signal = max(sec, ct)
+            src = source_priority_score(md.get("source_priority", "primary_filing") or "primary_filing")
+            rec = recency_score(md.get("fiscal_year"))
 
             score = (
                 self.w.text * text_norm
@@ -150,39 +196,15 @@ class HybridRetriever:
             )
 
             reason = self._reason(
-                vec_rank.get(cid), kw_rank.get(cid), section_signal, src, rec
+                vec_rank.get(key), kw_rank.get(key), section_signal, src, rec
             )
 
             scored.append(
-                EvidenceItem(
-                    source_id=str(chunk.source_id),
-                    document_id=chunk.document_id,
-                    chunk_index=chunk.chunk_index,
-                    ticker=chunk.ticker,
-                    company_name=chunk.company_name,
-                    document_type=DocumentType(chunk.document_type)
-                    if _safe_enum(DocumentType, chunk.document_type)
-                    else DocumentType.OTHER,
-                    fiscal_year=chunk.fiscal_year,
-                    filing_date=chunk.filing_date,
-                    source_priority=SourcePriority(chunk.source_priority)
-                    if _safe_enum(SourcePriority, chunk.source_priority)
-                    else SourcePriority.OTHER,
-                    section=chunk.section,
-                    subsection=chunk.subsection,
-                    content_type=ContentType(chunk.content_type)
-                    if _safe_enum(ContentType, chunk.content_type)
-                    else ContentType.OTHER,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                    text=chunk.chunk_text,
-                    metric_tags=list(chunk.metric_tags or []),
-                    risk_tags=list(chunk.risk_tags or []),
-                    relevance_score=round(score, 4),
-                    retrieval_reason=reason,
-                    score_breakdown={
-                        # Each ranker's normalized RRF contribution (0 if
-                        # this chunk wasn't in that ranker's top-k).
+                _document_to_evidence(
+                    doc=doc,
+                    score=score,
+                    reason=reason,
+                    breakdown={
                         "vector": round(v_rrf / _RRF_MAX, 4),
                         "keyword": round(kw_rrf / _RRF_MAX, 4),
                         "section": round(section_signal, 4),
@@ -194,6 +216,11 @@ class HybridRetriever:
 
         scored.sort(key=lambda e: e.relevance_score, reverse=True)
         return scored[:top_k]
+
+    @staticmethod
+    def _key(doc: Document) -> str:
+        md = doc.metadata or {}
+        return str(md.get("source_id") or doc.id or id(doc))
 
     @staticmethod
     def _reason(
@@ -221,9 +248,57 @@ class HybridRetriever:
         return "; ".join(parts)
 
 
-def _safe_enum(enum_cls, value: str) -> bool:
+# ----------------------------------------------------------------------
+# Document → EvidenceItem
+# ----------------------------------------------------------------------
+def _document_to_evidence(
+    doc: Document,
+    *,
+    score: float,
+    reason: str,
+    breakdown: dict[str, float],
+) -> EvidenceItem:
+    md = doc.metadata or {}
+
+    return EvidenceItem(
+        source_id=str(md.get("source_id") or uuid.uuid4()),
+        document_id=int(md.get("document_id") or 0),
+        chunk_index=int(md.get("chunk_index") or 0),
+        ticker=str(md.get("ticker") or ""),
+        company_name=md.get("company_name"),
+        document_type=_safe_enum(DocumentType, md.get("document_type"), DocumentType.OTHER),
+        fiscal_year=md.get("fiscal_year"),
+        filing_date=_parse_date(md.get("filing_date")),
+        source_priority=_safe_enum(
+            SourcePriority, md.get("source_priority"), SourcePriority.PRIMARY_FILING
+        ),
+        section=str(md.get("section") or ""),
+        subsection=md.get("subsection"),
+        content_type=_safe_enum(ContentType, md.get("content_type"), ContentType.PARAGRAPH),
+        page_start=md.get("page_start"),
+        page_end=md.get("page_end"),
+        text=doc.page_content or "",
+        metric_tags=list(md.get("metric_tags") or []),
+        risk_tags=list(md.get("risk_tags") or []),
+        relevance_score=round(score, 4),
+        retrieval_reason=reason,
+        score_breakdown=breakdown,
+    )
+
+
+def _safe_enum(enum_cls, value, default):
     try:
-        enum_cls(value)
-        return True
+        return enum_cls(value) if value is not None else default
     except ValueError:
-        return False
+        return default
+
+
+def _parse_date(value: Any) -> date_cls | None:
+    if value is None:
+        return None
+    if isinstance(value, date_cls):
+        return value
+    try:
+        return date_cls.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
